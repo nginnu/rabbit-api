@@ -1,0 +1,163 @@
+name: release
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "shop-api/**"
+      - "notification-api/**"
+      - ".github/workflows/release.yml"
+
+permissions: {}
+
+env:
+  TRIVY_VERSION: "0.74.0"
+  GITOPS_REPO: nginnu/rabbit-gitops
+
+jobs:
+  build:
+    name: build · ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Four binaries out of one module, selected by the SVC build arg the
+          # Dockerfile already takes. One context, four images.
+          - { service: auth, context: shop-api, svc: auth }
+          - { service: catalog, context: shop-api, svc: catalog }
+          - { service: order, context: shop-api, svc: order }
+          - { service: payment, context: shop-api, svc: payment }
+          # Its own module and its own Dockerfile, so no SVC arg to pass.
+          - { service: notification, context: notification-api, svc: "" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # The cache is scoped per service. One shared scope has five parallel
+      # builds overwriting each other's manifest and every build missing.
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/rabbit-${{ matrix.service }}:${{ steps.meta.outputs.tag }}
+          build-args: |
+            SVC=${{ matrix.svc }}
+            VERSION=${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+          provenance: false
+
+      - name: install trivy
+        run: |
+          curl -sSfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+            | tar -xz -C /usr/local/bin trivy
+
+      # Scanning the pushed image, not the source: this is the layer set that
+      # will actually run, base image included. shop-api ships on alpine, which
+      # carries CVEs the Go module graph knows nothing about.
+      - name: trivy image
+        run: |
+          trivy image \
+            "${{ secrets.DOCKERHUB_USERNAME }}/rabbit-${{ matrix.service }}:${{ steps.meta.outputs.tag }}" \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --exit-code 1 \
+            --format sarif \
+            --output trivy-${{ matrix.service }}.sarif
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-image-${{ matrix.service }}
+          path: trivy-${{ matrix.service }}.sarif
+          retention-days: 14
+
+  # One promote for all five services: they share a commit, so they share a tag,
+  # and five separate commits into gitops would have ArgoCD sync a half-updated
+  # set four times.
+  promote:
+    name: promote · gitops
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Two releases in flight would both push to the same branch of the same
+    # repo. Not cancel-in-progress: the older one may already have pushed.
+    concurrency:
+      group: promote-gitops
+      cancel-in-progress: false
+    steps:
+      - name: checkout gitops
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          # GITHUB_TOKEN is scoped to this repository only — it cannot write to
+          # another one. A PAT is the only thing that can, which is also why the
+          # loop guard in the gitops workflow cannot rely on GITHUB_TOKEN's
+          # not-triggering behaviour.
+          token: ${{ secrets.GITOPS_PAT }}
+          path: gitops
+
+      - name: write image tags
+        env:
+          REGISTRY_NS: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          tag="${GITHUB_SHA::7}"
+          for svc in auth catalog order payment notification; do
+            chart="gitops/charts/${svc}"
+            [ -d "$chart" ] || { echo "::error::no chart at ${chart}"; exit 1; }
+
+            # A separate file, never values.yaml. values.yaml is what
+            # `make up` reads on a laptop with no registry: pullPolicy Never and
+            # a tag that was kind-loaded. Overwriting it with a sha that only
+            # exists on Docker Hub breaks the local path for everyone.
+            #
+            # printf, not a heredoc: inside `run: |` every line carries the
+            # block's indentation, and an indented delimiter never closes a
+            # plain <<EOF — the step runs to the end of the script looking for
+            # it and fails with an unexpected end of file.
+            printf '%s\n' \
+              "# Written by ${GITHUB_REPOSITORY}@${GITHUB_SHA}." \
+              "# Generated — the next release overwrites this file." \
+              "services:" \
+              "  ${svc}:" \
+              "    image:" \
+              "      repository: ${REGISTRY_NS}/rabbit-${svc}" \
+              "      tag: ${tag}" \
+              "      pullPolicy: IfNotPresent" \
+              > "${chart}/values-ci.yaml"
+          done
+          git -C gitops diff --stat
+
+      - name: commit and push
+        working-directory: gitops
+        run: |
+          git config user.name "rabbit-ci"
+          git config user.email "ci@rabbit.invalid"
+          if git diff --quiet; then
+            echo "no tag changed — nothing to promote"
+            exit 0
+          fi
+          git add charts/*/values-ci.yaml
+          git commit -m "chore(images): api ${GITHUB_SHA::7}"
+          # Another repo's promote may have landed between checkout and push.
+          # Rebase and retry rather than fail the release over a race.
+          for attempt in 1 2 3; do
+            if git push; then exit 0; fi
+            git pull --rebase
+          done
+          echo "::error::could not push to ${GITOPS_REPO} after 3 attempts"
+          exit 1

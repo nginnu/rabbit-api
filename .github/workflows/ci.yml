@@ -1,0 +1,265 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  TRUFFLEHOG_VERSION: "3.97.0"
+  TRIVY_VERSION: "0.74.0"
+  SEMGREP_VERSION: "1.173.0"
+  GOLANGCI_VERSION: "v2.13.0"
+
+jobs:
+  guardrails:
+    name: guardrails · secrets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: install gitleaks
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+      - run: gitleaks git . --report-format sarif --report-path gitleaks.sarif --redact --exit-code 1
+      - name: install trufflehog
+        if: always()
+        run: |
+          curl -sSfL "https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VERSION}/trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin trufflehog
+      - name: trufflehog · verified only
+        if: always()
+        run: |
+          trufflehog git file://. --only-verified --fail --json > trufflehog.json || status=$?
+          cat trufflehog.json
+          exit "${status:-0}"
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: guardrails-reports
+          path: |
+            gitleaks.sarif
+            trufflehog.json
+          retention-days: 14
+
+  # Two modules, two Go versions — shop-api is on 1.25 and notification-api on
+  # 1.26. One setup-go pinned to a single version silently builds one of them
+  # against a toolchain its go.mod does not ask for.
+  test:
+    name: test · ${{ matrix.module }}
+    needs: guardrails
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [shop-api, notification-api]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      - name: vet
+        working-directory: ${{ matrix.module }}
+        run: go vet ./...
+
+      # -race because every one of these services handles concurrent requests,
+      # and a data race passes a serial test run every time.
+      - name: test
+        working-directory: ${{ matrix.module }}
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: coverage summary
+        working-directory: ${{ matrix.module }}
+        run: |
+          go tool cover -func=coverage.out | tail -1
+          {
+            echo "### coverage · ${{ matrix.module }}"
+            echo '```'
+            go tool cover -func=coverage.out | tail -20
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-${{ matrix.module }}
+          path: ${{ matrix.module }}/coverage.out
+          retention-days: 14
+
+  lint:
+    name: lint · golangci
+    needs: guardrails
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [shop-api, notification-api]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: ${{ env.GOLANGCI_VERSION }}
+          working-directory: ${{ matrix.module }}
+
+  sast:
+    name: sast · semgrep
+    needs: guardrails
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet "semgrep==${SEMGREP_VERSION#v}"
+      - run: semgrep --config p/golang --config p/ci --sarif --output semgrep.sarif --error
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  # Dependency scan, not image scan — the image does not exist yet at PR time.
+  # trivy fs reads go.sum directly, so a vulnerable module is caught before
+  # anything is built from it.
+  sca:
+    name: sca · trivy fs
+    needs: guardrails
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: install trivy
+        run: |
+          curl -sSfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+            | tar -xz -C /usr/local/bin trivy
+      - name: trivy fs
+        run: |
+          trivy fs . \
+            --scanners vuln,secret,license \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --format sarif \
+            --output trivy-fs.sarif
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  # `secrets` cannot be read in a job-level `if`, so availability is turned into
+  # a job output first. Without this the licensed scanners below either run
+  # unconfigured and fail, or are commented out and forgotten.
+  licensed-scanners-available:
+    name: licensed scanners · availability
+    needs: guardrails
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      sonar: ${{ steps.check.outputs.sonar }}
+      snyk: ${{ steps.check.outputs.snyk }}
+    steps:
+      - id: check
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          echo "sonar=${SONAR_TOKEN:+true}" >> "$GITHUB_OUTPUT"
+          echo "snyk=${SNYK_TOKEN:+true}" >> "$GITHUB_OUTPUT"
+          echo "### licensed scanners" >> "$GITHUB_STEP_SUMMARY"
+          echo "| scanner | token | status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| SonarQube | SONAR_TOKEN | ${SONAR_TOKEN:+configured}${SONAR_TOKEN:-absent — skipped} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Snyk | SNYK_TOKEN | ${SNYK_TOKEN:+configured}${SNYK_TOKEN:-absent — skipped} |" >> "$GITHUB_STEP_SUMMARY"
+
+  sonarqube:
+    name: sast · sonarqube
+    needs: [test, licensed-scanners-available]
+    if: needs.licensed-scanners-available.outputs.sonar == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Sonar attributes findings to commits; a shallow clone leaves every
+          # line blamed on the merge.
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: coverage
+      - uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+  snyk:
+    name: sca · snyk
+    needs: [guardrails, licensed-scanners-available]
+    if: needs.licensed-scanners-available.outputs.snyk == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      matrix:
+        module: [shop-api, notification-api]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: snyk/actions/golang@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --file=${{ matrix.module }}/go.mod --sarif-file-output=snyk.sarif
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: snyk.sarif
+          category: snyk-${{ matrix.module }}
+
+  gate:
+    name: ci gate
+    needs: [guardrails, test, lint, sast, sca]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: |
+          echo '${{ toJSON(needs) }}'
+          if echo '${{ toJSON(needs) }}' | grep -q '"result": *"\(failure\|cancelled\)"'; then
+            echo "::error::one or more ci jobs failed"
+            exit 1
+          fi
