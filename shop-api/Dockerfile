@@ -1,6 +1,6 @@
 # One image per service, selected by the SVC build arg.
 #
-#   docker build --build-arg SVC=auth -t auth apps/services
+#   docker build --build-arg SVC=auth -t auth shop-api
 
 # ─── Stage 1: build ─────────────────────────────────────────────
 # go.mod pins go >= 1.25 (auto-bumped by linter) — image must match
