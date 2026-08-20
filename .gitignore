@@ -1,0 +1,26 @@
+# Go
+*.so
+*.o
+*.a
+*.out
+*.test
+*.prof
+*.pprof
+dist/
+bin/
+vendor/
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.env
+.env.local
+
+# Temp
+*.tmp
+*.temp
+/tmp/
