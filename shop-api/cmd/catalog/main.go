@@ -44,7 +44,7 @@ func main() {
 		slog.Error("otel init failed", "err", err)
 		os.Exit(1)
 	}
-	defer shutdown(ctx)
+	defer func() { _ = shutdown(ctx) }()
 
 	profiler.Init(cfg.ServiceName(serviceShortName))
 
@@ -65,7 +65,7 @@ func main() {
 		log.Error("redis client init failed", "err", err)
 		os.Exit(1)
 	}
-	defer redisClient.Close()
+	defer func() { _ = redisClient.Close() }()
 
 	if err := db.PingRedis(redisClient); err != nil {
 		log.Warn("redis unreachable at startup — continuing with DB-only reads",

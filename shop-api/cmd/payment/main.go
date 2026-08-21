@@ -46,7 +46,7 @@ func main() {
 		slog.Error("otel init failed", "err", err)
 		os.Exit(1)
 	}
-	defer shutdown(ctx)
+	defer func() { _ = shutdown(ctx) }()
 
 	profiler.Init(cfg.ServiceName(serviceShortName))
 
@@ -142,7 +142,7 @@ func main() {
 					conn, _, _ := hj.Hijack()
 					if conn != nil {
 						_ = conn.(*net.TCPConn).SetLinger(0)
-						conn.Close()
+						_ = conn.Close()
 					}
 				}
 			default:

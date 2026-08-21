@@ -84,7 +84,7 @@ func (m *PaymentGatewayClient) Charge(ctx context.Context, amount float64, metho
 		span.RecordError(err)
 		return nil, fmt.Errorf("call payment-gateway: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
 
@@ -104,7 +104,3 @@ func (m *PaymentGatewayClient) Charge(ctx context.Context, amount float64, metho
 	return &result, nil
 }
 
-// bytesReader is a helper to avoid importing bytes in order.go.
-func bytesReader(b []byte) io.Reader {
-	return bytes.NewReader(b)
-}

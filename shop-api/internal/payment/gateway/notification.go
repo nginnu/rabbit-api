@@ -64,7 +64,7 @@ func (n *NotificationClient) Notify(ctx context.Context, paymentID, orderID int,
 		span.RecordError(err)
 		return fmt.Errorf("call notification: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
 
