@@ -1,18 +1,26 @@
 name: release
 
+# Runs only after ci finishes. A red test suite must not put an image on the
+# registry or a tag into the gitops repo.
+#
+# workflow_run has no `paths:` filter, and does not need one — the changes job
+# below decides what to build.
 on:
-  push:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
     branches: [main, master]
-    paths:
-      - "shop-api/**"
-      - "notification-api/**"
-      - ".github/workflows/release.yml"
 
 permissions: {}
 
 env:
   TRIVY_VERSION: "0.74.0"
   GITOPS_REPO: nginnu/rabbit-gitops
+  # For workflow_run, GITHUB_SHA is the last commit on the default branch, not
+  # the commit ci just tested. Using it would tag an image with a sha whose code
+  # is not inside it.
+  # https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run
+  SHA: ${{ github.event.workflow_run.head_sha }}
 
 jobs:
   # Which services this commit actually touched. Without this every push
@@ -21,6 +29,7 @@ jobs:
   # that cannot happen.
   changes:
     name: changes · which services
+    if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -31,13 +40,18 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}
           # The diff below needs the parent commit present. The default shallow
           # clone has only the tip and every path comes back as changed.
           fetch-depth: 0
 
       - id: detect
         env:
-          BEFORE: ${{ github.event.before }}
+          # The parent of the tested commit. A push carrying several commits at
+          # once is compared against the last one only, so a service touched by
+          # an earlier commit in that push keeps its old tag until something
+          # else rebuilds it.
+          BEFORE: ${{ github.event.workflow_run.head_sha }}^
         run: |
           set -euo pipefail
           all="auth catalog order payment notification"
@@ -52,7 +66,7 @@ jobs:
             echo "base ${BEFORE:-<empty>} unusable — building every service"
             changed="$all"
           else
-            git diff --name-only "$BEFORE" "$GITHUB_SHA" > changed-files.txt
+            git diff --name-only "$BEFORE" "$SHA" > changed-files.txt
             changed=""
             while IFS= read -r f; do
               [ -n "$f" ] || continue
@@ -114,10 +128,12 @@ jobs:
         include: ${{ fromJSON(needs.changes.outputs.matrix) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - id: meta
         run: |
-          echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "tag=${SHA::7}" >> "$GITHUB_OUTPUT"
           echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -138,7 +154,7 @@ jobs:
           build-args: |
             SVC=${{ matrix.svc }}
             VERSION=${{ steps.meta.outputs.tag }}
-            COMMIT=${{ github.sha }}
+            COMMIT=${{ github.event.workflow_run.head_sha }}
             BUILD_TIME=${{ steps.meta.outputs.build_time }}
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,scope=${{ matrix.service }},mode=max
@@ -200,7 +216,7 @@ jobs:
           REGISTRY_NS: ${{ secrets.DOCKERHUB_USERNAME }}
           SERVICES: ${{ needs.changes.outputs.services }}
         run: |
-          tag="${GITHUB_SHA::7}"
+          tag="${SHA::7}"
           for svc in $SERVICES; do
             chart="gitops/charts/${svc}"
             [ -d "$chart" ] || { echo "::error::no chart at ${chart}"; exit 1; }
@@ -215,7 +231,7 @@ jobs:
             # plain <<EOF — the step runs to the end of the script looking for
             # it and fails with an unexpected end of file.
             printf '%s\n' \
-              "# Written by ${GITHUB_REPOSITORY}@${GITHUB_SHA}." \
+              "# Written by ${GITHUB_REPOSITORY}@${SHA}." \
               "# Generated — the next release overwrites this file." \
               "services:" \
               "  ${svc}:" \
@@ -248,7 +264,7 @@ jobs:
             echo "no tag changed — nothing to promote"
             exit 0
           fi
-          git commit -m "chore(images): api ${GITHUB_SHA::7} (${SERVICES})"
+          git commit -m "chore(images): api ${SHA::7} (${SERVICES})"
           # Another repo's promote may have landed between checkout and push.
           # Rebase and retry rather than fail the release over a race.
           for attempt in 1 2 3; do
