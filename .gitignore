@@ -24,3 +24,6 @@ vendor/
 *.tmp
 *.temp
 /tmp/
+
+# compiled binary — Docker builds it from source
+notification-api/notification
