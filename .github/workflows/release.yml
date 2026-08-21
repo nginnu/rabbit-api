@@ -15,23 +15,103 @@ env:
   GITOPS_REPO: nginnu/rabbit-gitops
 
 jobs:
+  # Which services this commit actually touched. Without this every push
+  # rebuilds all five, every service gets a new tag, and rolling one back drags
+  # its four siblings with it — the charts are separate releases precisely so
+  # that cannot happen.
+  changes:
+    name: changes · which services
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+      services: ${{ steps.detect.outputs.services }}
+      any: ${{ steps.detect.outputs.any }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The diff below needs the parent commit present. The default shallow
+          # clone has only the tip and every path comes back as changed.
+          fetch-depth: 0
+
+      - id: detect
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          all="auth catalog order payment notification"
+
+          # A force-push leaves BEFORE pointing at a commit that is no longer
+          # reachable, and the first push to a branch sets it to all zeros.
+          # git diff against either one exits non-zero and the release would end
+          # having built nothing, with no failure to show for it.
+          if [ -z "${BEFORE:-}" ] \
+            || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+            || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            echo "base ${BEFORE:-<empty>} unusable — building every service"
+            changed="$all"
+          else
+            git diff --name-only "$BEFORE" "$GITHUB_SHA" > changed-files.txt
+            changed=""
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              case "$f" in
+                shop-api/cmd/auth/*|shop-api/internal/auth/*)       changed="$changed auth" ;;
+                shop-api/cmd/catalog/*|shop-api/internal/catalog/*) changed="$changed catalog" ;;
+                shop-api/cmd/order/*|shop-api/internal/order/*)     changed="$changed order" ;;
+                shop-api/cmd/payment/*|shop-api/internal/payment/*) changed="$changed payment" ;;
+                # Anything else under shop-api is shared by all four binaries:
+                # internal/shared, go.mod, go.sum, the Dockerfile. Listing them
+                # one by one means a file added later matches nothing and its
+                # service silently stops being built.
+                shop-api/*)                                         changed="$changed auth catalog order payment" ;;
+                notification-api/*)                                 changed="$changed notification" ;;
+                .github/workflows/release.yml)                      changed="$changed $all" ;;
+              esac
+            done < changed-files.txt
+          fi
+
+          changed=$(printf '%s' "$changed" | tr ' ' '\n' | sort -u | xargs)
+
+          entries=""
+          for svc in $changed; do
+            case "$svc" in
+              # Its own module and its own Dockerfile, so no SVC arg to pass.
+              notification) entry='{"service":"notification","context":"notification-api","svc":""}' ;;
+              # Four binaries out of one module, selected by the SVC build arg
+              # the Dockerfile already takes. One context, four images.
+              *)            entry="{\"service\":\"${svc}\",\"context\":\"shop-api\",\"svc\":\"${svc}\"}" ;;
+            esac
+            entries="${entries:+${entries},}${entry}"
+          done
+
+          echo "matrix=[${entries}]" >> "$GITHUB_OUTPUT"
+          echo "services=${changed}" >> "$GITHUB_OUTPUT"
+          if [ -n "$changed" ]; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "any=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo "### services to release"
+            echo '```'
+            echo "${changed:-none}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   build:
     name: build · ${{ matrix.service }}
+    needs: changes
+    if: needs.changes.outputs.any == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Four binaries out of one module, selected by the SVC build arg the
-          # Dockerfile already takes. One context, four images.
-          - { service: auth, context: shop-api, svc: auth }
-          - { service: catalog, context: shop-api, svc: catalog }
-          - { service: order, context: shop-api, svc: order }
-          - { service: payment, context: shop-api, svc: payment }
-          # Its own module and its own Dockerfile, so no SVC arg to pass.
-          - { service: notification, context: notification-api, svc: "" }
+        include: ${{ fromJSON(needs.changes.outputs.matrix) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -89,12 +169,12 @@ jobs:
           path: trivy-${{ matrix.service }}.sarif
           retention-days: 14
 
-  # One promote for all five services: they share a commit, so they share a tag,
-  # and five separate commits into gitops would have ArgoCD sync a half-updated
-  # set four times.
+  # Writes only the services `changes` selected. Rewriting all five would pin
+  # the four that were not rebuilt to a tag that exists nowhere, and they would
+  # come back ErrImagePull on a commit that never touched them.
   promote:
     name: promote · gitops
-    needs: build
+    needs: [changes, build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -118,9 +198,10 @@ jobs:
       - name: write image tags
         env:
           REGISTRY_NS: ${{ secrets.DOCKERHUB_USERNAME }}
+          SERVICES: ${{ needs.changes.outputs.services }}
         run: |
           tag="${GITHUB_SHA::7}"
-          for svc in auth catalog order payment notification; do
+          for svc in $SERVICES; do
             chart="gitops/charts/${svc}"
             [ -d "$chart" ] || { echo "::error::no chart at ${chart}"; exit 1; }
 
@@ -148,6 +229,8 @@ jobs:
 
       - name: commit and push
         working-directory: gitops
+        env:
+          SERVICES: ${{ needs.changes.outputs.services }}
         run: |
           git config user.name "rabbit-ci"
           git config user.email "ci@rabbit.invalid"
@@ -155,12 +238,17 @@ jobs:
           # gitops repo until the first promote writes it, and `git diff` on an
           # untracked file reports no change — the job then said "nothing to
           # promote" and exited 0 on the run that was supposed to create it.
-          git add charts/*/values-ci.yaml
+          #
+          # Named one by one rather than charts/*/values-ci.yaml: the glob would
+          # also stage a file this run did not write.
+          for svc in $SERVICES; do
+            git add "charts/${svc}/values-ci.yaml"
+          done
           if git diff --cached --quiet; then
             echo "no tag changed — nothing to promote"
             exit 0
           fi
-          git commit -m "chore(images): api ${GITHUB_SHA::7}"
+          git commit -m "chore(images): api ${GITHUB_SHA::7} (${SERVICES})"
           # Another repo's promote may have landed between checkout and push.
           # Rebase and retry rather than fail the release over a race.
           for attempt in 1 2 3; do
