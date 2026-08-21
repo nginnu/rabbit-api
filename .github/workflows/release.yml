@@ -140,7 +140,7 @@ jobs:
               "  ${svc}:" \
               "    image:" \
               "      repository: ${REGISTRY_NS}/rabbit-${svc}" \
-              "      tag: ${tag}" \
+              "      tag: \"${tag}\"" \
               "      pullPolicy: IfNotPresent" \
               > "${chart}/values-ci.yaml"
           done
