@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 // testMux builds the real mux through newMux with the log sink the caller
@@ -24,11 +28,55 @@ func testMux(t *testing.T, log *slog.Logger) (*http.ServeMux, *chaos, *notifySto
 	return newMux(log, c, notes), c, notes
 }
 
+// testHandler builds the composition main serves — probes outside the otelhttp
+// wrap, everything else inside — with a manual reader so a test can count what
+// was actually recorded. Driving newMux alone would pass whichever side of the
+// wrap the probes were on, which is the whole question.
+func testHandler(t *testing.T) (http.Handler, *sdkmetric.ManualReader, *chaos) {
+	t.Helper()
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+	c := &chaos{}
+	return newHandler(discardLogger(), c, &notifyStore{}, mp), reader, c
+}
+
+// recordedDataPoints counts every data point the reader holds. Counting points
+// rather than metric names keeps the assertion off otelhttp's instrument names,
+// which move with the semconv version.
+func recordedDataPoints(t *testing.T, reader *sdkmetric.ManualReader) int {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	n := 0
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			switch a := m.Data.(type) {
+			case metricdata.Histogram[float64]:
+				n += len(a.DataPoints)
+			case metricdata.Histogram[int64]:
+				n += len(a.DataPoints)
+			case metricdata.Sum[int64]:
+				n += len(a.DataPoints)
+			case metricdata.Sum[float64]:
+				n += len(a.DataPoints)
+			case metricdata.Gauge[int64]:
+				n += len(a.DataPoints)
+			case metricdata.Gauge[float64]:
+				n += len(a.DataPoints)
+			}
+		}
+	}
+	return n
+}
+
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewJSONHandler(io.Discard, nil))
 }
 
-func postJSON(t *testing.T, mux *http.ServeMux, path, body string) *httptest.ResponseRecorder {
+func postJSON(t *testing.T, mux http.Handler, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	rec := httptest.NewRecorder()
@@ -36,7 +84,7 @@ func postJSON(t *testing.T, mux *http.ServeMux, path, body string) *httptest.Res
 	return rec
 }
 
-func getJSON(t *testing.T, mux *http.ServeMux, path string) *httptest.ResponseRecorder {
+func getJSON(t *testing.T, mux http.Handler, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, path, nil)
 	rec := httptest.NewRecorder()
@@ -308,13 +356,12 @@ func TestChaosFailsRequestBeforeHandler(t *testing.T) {
 // --- probes and info ---
 
 func TestProbes(t *testing.T) {
-	mux, _, _ := testMux(t, discardLogger())
+	handler, _, _ := testHandler(t)
 
 	for path, want := range map[string]string{
 		"/healthz": "ok",
-		"/readyz":  "ready",
 	} {
-		rec := getJSON(t, mux, path)
+		rec := getJSON(t, handler, path)
 		if rec.Code != http.StatusOK {
 			t.Errorf("%s status = %d, want 200", path, rec.Code)
 			continue
@@ -325,6 +372,33 @@ func TestProbes(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Status != want {
 			t.Errorf("%s body = %s, want status %q", path, rec.Body.String(), want)
 		}
+	}
+}
+
+// The regression this guards: probes registered one line lower, inside the
+// otelhttp wrap. Nothing fails when that happens — the pod is healthy, the
+// dashboard is full — but at 5 replicas the kubelet is ~18 requests a minute
+// per pod and /notify is one per checkout, so every panel reads probe traffic
+// and the checkout traces sit under a pile of probe spans.
+func TestProbesRecordNoMetrics(t *testing.T) {
+	handler, reader, _ := testHandler(t)
+
+	for _, path := range []string{"/healthz"} {
+		if rec := getJSON(t, handler, path); rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200", path, rec.Code)
+		}
+	}
+	if n := recordedDataPoints(t, reader); n != 0 {
+		t.Errorf("probes recorded %d data points, want 0 — they are inside the otelhttp wrap", n)
+	}
+
+	// And the wrap is still live for the routes that matter, or the assertion
+	// above would pass on a handler that instruments nothing at all.
+	if rec := postJSON(t, handler, "/notify", `{"order_id":1,"payment_id":2}`); rec.Code != http.StatusOK {
+		t.Fatalf("notify status = %d, want 200", rec.Code)
+	}
+	if n := recordedDataPoints(t, reader); n == 0 {
+		t.Error("/notify recorded no data points — otelhttp is not wrapping the app routes")
 	}
 }
 
@@ -353,7 +427,7 @@ func TestRootServesServiceInfo(t *testing.T) {
 // endpoint failing, /chaos/error-rate is the only way to turn it off — if this
 // ever breaks, a chaos experiment becomes an outage that needs a redeploy.
 func TestChaosControlPlaneSurvivesInjectedFailure(t *testing.T) {
-	mux, c, _ := testMux(t, discardLogger())
+	mux, _, c := testHandler(t)
 	c.setRate(1.0)
 
 	// Data endpoint fails...

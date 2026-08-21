@@ -381,15 +381,7 @@ func main() {
 	c := &chaos{}
 	notes := &notifyStore{}
 
-	// otelhttp spans every request, extracts traceparent + baggage from
-	// payment-svc's call, and records http.server metrics on the meter above —
-	// the same instrument the services emit, so notification shows up in the
-	// http_server_request_duration_seconds queries like every other hop.
-	handler := otelhttp.NewHandler(
-		newMux(log, c, notes),
-		serviceShortName,
-		otelhttp.WithMeterProvider(meterProvider),
-	)
+	handler := newHandler(log, c, notes, meterProvider)
 
 	srv := &http.Server{
 		Addr:              ":" + port,
@@ -426,19 +418,48 @@ func main() {
 	}
 }
 
-// newMux wires every route on its own mux instead of inside main so tests can
-// drive the exact mux the process serves — a hand-rebuilt copy in a test would
-// drift from this one and quietly stop testing what ships. The otelhttp wrap
-// deliberately lives in main: tests run the mux bare, with no providers set,
-// and otelhttp would then span and propagate nothing.
-func newMux(log *slog.Logger, c *chaos, notes *notifyStore) *http.ServeMux {
+// newHandler composes what the process serves: the probes on the outer mux,
+// everything else through otelhttp. The order is the point — the kubelet hits
+// a readiness probe every 5s on every one of 5 replicas, so instrumented
+// probes are 60 spans a minute and the same count in
+// http_server_request_duration_seconds, while /notify fires once per checkout.
+// The real calls end up a rounding error in this service's own dashboard and
+// its traces sit buried under probe spans. The gin services get this ordering
+// by registering /healthz before r.Use(middleware.OTel(...)); this is the same
+// rule with the mux written out.
+func newHandler(log *slog.Logger, c *chaos, notes *notifyStore, mp *sdkmetric.MeterProvider) http.Handler {
+	root := newProbeMux()
+	root.Handle("/", otelhttp.NewHandler(
+		newMux(log, c, notes),
+		serviceShortName,
+		otelhttp.WithMeterProvider(mp),
+	))
+	return root
+}
+
+// newProbeMux answers the kubelet and nothing else. It is a separate mux rather
+// than one more route on newMux so the probe cannot be pulled back inside the
+// otelhttp wrap by a later edit that adds a route next to its neighbours.
+//
+// One path for both probes, which is what the other four services serve. A
+// separate /readyz would have to mean something different from /healthz to
+// earn its place, and this service has no dependency to report on — it holds
+// its records in memory and opens no connection at start.
+func newProbeMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
-	})
+	return mux
+}
+
+// newMux wires every instrumented route on its own mux instead of inside main
+// so tests can drive the exact mux the process serves — a hand-rebuilt copy in
+// a test would drift from this one and quietly stop testing what ships. The
+// otelhttp wrap lives in newHandler: tests run this mux bare, with no providers
+// set, and otelhttp would then span and propagate nothing.
+func newMux(log *slog.Logger, c *chaos, notes *notifyStore) *http.ServeMux {
+	mux := http.NewServeMux()
 
 	mux.Handle("GET /", instrument(c, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
